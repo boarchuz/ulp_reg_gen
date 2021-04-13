@@ -8,22 +8,21 @@
 #include "esp32/ulp.h"
 #include "soc/rtc_io_reg.h"
 #include "soc/rtc_cntl_reg.h"
+#include "soc/sens_reg.h"
 
 #include "sdkconfig.h"
 
 static const char* TAG = "ulp_reg";
 
-// Low bit of reg write instruction must be 0,8,16,24 as LSB 3 bits are always set to 0 by ST instruction
-// As this example sets RTCIO output value reg, and they begin at 14 (RTC_GPIO_OUT_DATA_W1TS_S), low=16 and low=24 are options, ie. RTCIO 2 or 10
-// RTCIO 2 (GPIO 38) has no output capability, so RTCIO 10 (GPIO 4) is selected
-
-#define GPIO_NUM 4
-#define RTCIO_NUM 10
+// 10 bits corresponding to the register value for a reg_wr are taken up by the register address, leaving 6 variable bits
 
 #define I_SET_PIN_HIGH() I_WR_REG_BIT(RTC_GPIO_OUT_REG, (RTC_GPIO_OUT_DATA_S + (RTCIO_NUM)), 1)
 
-#define I_DESIRED_INSTRUCTION   I_SET_PIN_HIGH
+#define ULP_TEST_WR_REG SENS_ULP_CP_SLEEP_CYC1_REG
 
+#define I_ULP_TEST_INSN() I_WR_REG(ULP_TEST_WR_REG, 0, 5, 0)
+
+#define I_DESIRED_INSTRUCTION   I_SET_PIN_HIGH
 typedef struct {
     uint32_t val : 16;
     uint32_t ptr_reg : 2;
@@ -33,12 +32,65 @@ typedef struct {
 
 _Static_assert(sizeof(ulp_stored_word_t) == sizeof(ulp_insn_t), "incompatible struct");
 
-void ulp_generate_insn()
+void ulp_generate_sleep_loop()
 {
     memset(RTC_SLOW_MEM, 0, CONFIG_ULP_COPROC_RESERVE_MEM);
 
     // This is what we want the result of our ST instruction to produce:
-    ulp_insn_t desired_instruction = I_DESIRED_INSTRUCTION();
+    ulp_insn_t desired_instruction = I_ULP_TEST_INSN();
+
+    // This will lets us inspect what is needed to produce that result:
+    ulp_stored_word_t* required_st_output = (ulp_stored_word_t*)&desired_instruction;
+
+    uint8_t reg_temp = required_st_output->ptr_reg == R0 ? R1 : R0;
+    uint8_t reg_scratch = required_st_output->ptr_reg == R2 ? R3 : R2;
+    uint16_t register_address = desired_instruction.instruction & 0x3FF;
+    const ulp_insn_t st_program[] = {
+        // Suppose 6 bit value is in reg_temp. Shift it to make room for 10 bit register address.
+        I_LSHI(reg_scratch, reg_temp, 10),
+        // Put the register address in
+        I_ORI(reg_scratch, reg_scratch, register_address),
+        I_MOVI(required_st_output->ptr_reg, 0),     // Set ptr_reg to a known value so we can ST to RTC_SLOW_MEM[1] in the next instruction
+        I_ST(reg_scratch, required_st_output->ptr_reg, 1), // Create the instruction at RTC_SLOW_MEM[1]
+        I_BXI(1), // Branch to the instruction
+    };
+
+    uint32_t st_program_entry = required_st_output->pc - 3;
+    size_t st_program_size = sizeof(st_program) / sizeof(st_program)[0];
+    ESP_ERROR_CHECK( ulp_process_macros_and_load(st_program_entry, st_program, &st_program_size) ); // Will abort if instruction is beyond reserved region
+
+    // The generated instruction is at [1]. Set this just after it so it will end/halt after executing the generated instruction.
+    const ulp_insn_t loop_program[] = {
+        I_BXI(st_program_entry),
+            I_HALT(), // Placeholder, this is where the subroutine will generate instruction, then return here to execute it
+        I_ADDI(reg_temp, reg_temp, 1), // Increment value for next loop
+        I_HALT(),
+    };
+    size_t loop_program_size = sizeof(loop_program) / sizeof(loop_program)[0];
+    ESP_ERROR_CHECK( ulp_process_macros_and_load(0, loop_program, &loop_program_size) );
+
+    ESP_ERROR_CHECK( ulp_set_wakeup_period(0, 1 * 1000 * 1000) );
+    ESP_ERROR_CHECK( ulp_run(0) );
+
+    uint32_t current_val = REG_READ(ULP_TEST_WR_REG);
+    for(;;)
+    {
+        uint32_t new_val = REG_READ(ULP_TEST_WR_REG);
+        if(new_val != current_val)
+        {
+            current_val = new_val;
+            ESP_LOGI(TAG, "INSN: 0x%08X, Reg: 0x%08X", RTC_SLOW_MEM[1], current_val);
+        }
+        vTaskDelay(1);
+    }
+}
+
+void ulp_generate_sleep_insn()
+{
+    memset(RTC_SLOW_MEM, 0, CONFIG_ULP_COPROC_RESERVE_MEM);
+
+    // This is what we want the result of our ST instruction to produce:
+    ulp_insn_t desired_instruction = I_ULP_TEST_INSN();
 
     // This will lets us inspect what is needed to produce that result:
     ulp_stored_word_t* required_st_output = (ulp_stored_word_t*)&desired_instruction;
@@ -51,22 +103,24 @@ void ulp_generate_insn()
     }
 
     uint8_t reg_temp = required_st_output->ptr_reg == R0 ? R1 : R0;
+    uint8_t reg_scratch = required_st_output->ptr_reg == R2 ? R3 : R2;
+    uint16_t register_address = desired_instruction.instruction & 0x3FF;
     const ulp_insn_t st_program[] = {
-        I_MOVI(reg_temp, required_st_output->val),  // Prepare the value
+        // Suppose 6 bit value is in reg_temp. Shift it to make room for 10 bit register address.
+        I_LSHI(reg_scratch, reg_temp, 10),
+        // Put the register address in
+        I_ORI(reg_scratch, reg_scratch, register_address),
         I_MOVI(required_st_output->ptr_reg, 0),     // Set ptr_reg to a known value so we can ST to RTC_SLOW_MEM[0] in the next instruction
-        I_ST(reg_temp, required_st_output->ptr_reg, 0), // Create the instruction at RTC_SLOW_MEM[0]
+        I_ST(reg_scratch, required_st_output->ptr_reg, 0), // Create the instruction at RTC_SLOW_MEM[0]
         I_END(),
         I_HALT(), // Done
     };
 
-    uint32_t st_program_entry = required_st_output->pc - 2;
+    uint32_t st_program_entry = required_st_output->pc - 3;
     size_t st_program_size = sizeof(st_program) / sizeof(st_program)[0];
     ESP_ERROR_CHECK( ulp_process_macros_and_load(st_program_entry, st_program, &st_program_size) ); // Will abort if instruction is beyond reserved region
 
     uint32_t insn_before = RTC_SLOW_MEM[0];
-
-    ESP_LOGI(TAG, "Pin %d output low. Starting ULP in 3 seconds...", GPIO_NUM);
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
 
     ESP_ERROR_CHECK( ulp_run(st_program_entry) );
     // Let ULP generate the instruction
@@ -75,9 +129,15 @@ void ulp_generate_insn()
     ulp_insn_t *output_instruction = (ulp_insn_t *)&RTC_SLOW_MEM[0];
     ESP_LOGI(TAG, "Generated instruction: 0x%08X -> 0x%08X", insn_before, output_instruction->instruction);
 
-    if(memcmp(output_instruction, &desired_instruction, sizeof(*output_instruction)) != 0)
+    if(
+        output_instruction->wr_reg.opcode != desired_instruction.wr_reg.opcode ||
+        output_instruction->wr_reg.high != desired_instruction.wr_reg.high ||
+        output_instruction->wr_reg.low != desired_instruction.wr_reg.low ||
+        output_instruction->wr_reg.addr != desired_instruction.wr_reg.addr ||
+        output_instruction->wr_reg.periph_sel != desired_instruction.wr_reg.periph_sel
+    )
     {
-        ESP_LOGE(TAG, "Incorrect instruction generated! 0x%08X != 0x%08X", output_instruction->instruction, desired_instruction.instruction);
+        ESP_LOGE(TAG, "Incorrect instruction generated!");
         abort();
     }
 
@@ -89,29 +149,24 @@ void ulp_generate_insn()
     size_t end_program_size = sizeof(end_program) / sizeof(end_program)[0];
     ESP_ERROR_CHECK( ulp_process_macros_and_load(1, end_program, &end_program_size) );
 
-    // Prepare the pin so we can see if it works. Set output low. If successful, it will be set high by the ULP.
-    ESP_ERROR_CHECK( rtc_gpio_init(GPIO_NUM) );
-    ESP_ERROR_CHECK( rtc_gpio_set_level(GPIO_NUM, 0) );
-    ESP_ERROR_CHECK( rtc_gpio_set_direction(GPIO_NUM, RTC_GPIO_MODE_OUTPUT_ONLY) );
-
-    uint32_t reg_before = REG_READ(RTC_GPIO_OUT_REG);
-    uint32_t reg_expected = reg_before | (1 << (RTC_GPIO_OUT_DATA_S + (RTCIO_NUM)));
+    uint32_t reg_before = REG_READ(ULP_TEST_WR_REG);
     ESP_ERROR_CHECK( ulp_run(0) );
     // Let ULP execute the generated instruction
     vTaskDelay(100 / portTICK_PERIOD_MS);
-    uint32_t reg_after = REG_READ(RTC_GPIO_OUT_REG);
-    if(reg_after != reg_expected)
+    uint32_t reg_after = REG_READ(ULP_TEST_WR_REG);
+    ESP_LOGI(TAG, "Result: 0x%08X -> 0x%08X", reg_before, reg_after);
+
+    if(reg_after == reg_before)
     {
-        ESP_LOGE(TAG, "Failed. Expected: 0x%08X != Actual: 0x%08X", reg_expected, reg_after);
-    }
-    else
-    {
-        ESP_LOGI(TAG, "Success! 0x%08X -> 0x%08X", reg_before, reg_after);
+        abort();
     }
 }
 
 void app_main(void)
 {
-    ulp_generate_insn();
+    // runs once to check
+    ulp_generate_sleep_insn();
+    // loops, incrementing each time
+    ulp_generate_sleep_loop();
     vTaskDelete(NULL);   
 }
