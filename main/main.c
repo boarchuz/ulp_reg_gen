@@ -8,110 +8,184 @@
 #include "esp32/ulp.h"
 #include "soc/rtc_io_reg.h"
 #include "soc/rtc_cntl_reg.h"
+#include "soc/sens_reg.h"
 
 #include "sdkconfig.h"
 
-static const char* TAG = "ulp_reg";
+static const char* TAG = "ulp_reggp";
 
-// Low bit of reg write instruction must be 0,8,16,24 as LSB 3 bits are always set to 0 by ST instruction
-// As this example sets RTCIO output value reg, and they begin at 14 (RTC_GPIO_OUT_DATA_W1TS_S), low=16 and low=24 are options, ie. RTCIO 2 or 10
-// RTCIO 2 (GPIO 38) has no output capability, so RTCIO 10 (GPIO 4) is selected
+#define HULP_REGWR_VAL_SHIFT 10
+#define HULP_REGWR_IMM_VAL(register, value) \
+    (((value) << HULP_REGWR_VAL_SHIFT) | (SOC_REG_TO_ULP_PERIPH_SEL(register) << 8) | ((register & 0xFF) / sizeof(uint32_t)))
 
-#define GPIO_NUM 4
-#define RTCIO_NUM 10
+/**
+ * Each combination of high_bit and low_bit require a few words at a specific PC
+ *  
+ * Due to limitations of this method, low_bit may only be 0, 8, 16, or 24
+ */
+#define HULP_REGWR_WORK_OFFSET(low_bit, high_bit) \
+    (128 + (high_bit) * 4 + (low_bit) / 8)
 
-#define I_SET_PIN_HIGH() I_WR_REG_BIT(RTC_GPIO_OUT_REG, (RTC_GPIO_OUT_DATA_S + (RTCIO_NUM)), 1)
+/**
+ * At each of these PCs, this is the number of instructions required to implement the register write
+ */
+#define HULP_REGWR_WORK_COUNT 3
 
-#define I_DESIRED_INSTRUCTION   I_SET_PIN_HIGH
+#define HULP_REGWR_WORK_AREA_START (HULP_REGWR_WORK_OFFSET(0,0))
+#define HULP_REGWR_WORK_AREA_END (HULP_REGWR_WORK_OFFSET(24,31) + HULP_REGWR_WORK_COUNT)
 
-typedef struct {
-    uint32_t val : 16;
-    uint32_t ptr_reg : 2;
-    uint32_t unused : 3;
-    uint32_t pc : 11;
-} ulp_stored_word_t;
+#define HULP_WR_REG_GEN_SAFE_ENTRY 1024
+#define HULP_WR_REG_GEN_ENTRY 831
 
-_Static_assert(sizeof(ulp_stored_word_t) == sizeof(ulp_insn_t), "incompatible struct");
+#define ULP_WR_TEST_REG         SENS_ULP_CP_SLEEP_CYC2_REG
+#define ULP_WR_TEST_REG_LOW     0
+#define ULP_WR_TEST_REG_HIGH    31
+#define ULP_WR_TEST_REG_VAL     11     
 
-void ulp_generate_insn()
+static void load_basic_test()
 {
-    memset(RTC_SLOW_MEM, 0, CONFIG_ULP_COPROC_RESERVE_MEM);
-
-    // This is what we want the result of our ST instruction to produce:
-    ulp_insn_t desired_instruction = I_DESIRED_INSTRUCTION();
-
-    // This will lets us inspect what is needed to produce that result:
-    ulp_stored_word_t* required_st_output = (ulp_stored_word_t*)&desired_instruction;
-
-    ESP_LOGI(TAG, "ST (0x%08X) must be executed at PC %u with R%u as PTR and value %u", desired_instruction.instruction, required_st_output->pc, required_st_output->ptr_reg, required_st_output->val);
-    if(required_st_output->unused != 0)
-    {
-        ESP_LOGE(TAG, "Desired instruction requires zero'd bits so be set. If wr_reg, check low.");
-        abort();
-    }
-
-    uint8_t reg_temp = required_st_output->ptr_reg == R0 ? R1 : R0;
-    const ulp_insn_t st_program[] = {
-        I_MOVI(reg_temp, required_st_output->val),  // Prepare the value
-        I_MOVI(required_st_output->ptr_reg, 0),     // Set ptr_reg to a known value so we can ST to RTC_SLOW_MEM[0] in the next instruction
-        I_ST(reg_temp, required_st_output->ptr_reg, 0), // Create the instruction at RTC_SLOW_MEM[0]
-        I_END(),
-        I_HALT(), // Done
-    };
-
-    uint32_t st_program_entry = required_st_output->pc - 2;
-    size_t st_program_size = sizeof(st_program) / sizeof(st_program)[0];
-    ESP_ERROR_CHECK( ulp_process_macros_and_load(st_program_entry, st_program, &st_program_size) ); // Will abort if instruction is beyond reserved region
-
-    uint32_t insn_before = RTC_SLOW_MEM[0];
-
-    ESP_LOGI(TAG, "Pin %d output low. Starting ULP in 3 seconds...", GPIO_NUM);
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
-
-    ESP_ERROR_CHECK( ulp_run(st_program_entry) );
-    // Let ULP generate the instruction
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-
-    ulp_insn_t *output_instruction = (ulp_insn_t *)&RTC_SLOW_MEM[0];
-    ESP_LOGI(TAG, "Generated instruction: 0x%08X -> 0x%08X", insn_before, output_instruction->instruction);
-
-    if(memcmp(output_instruction, &desired_instruction, sizeof(*output_instruction)) != 0)
-    {
-        ESP_LOGE(TAG, "Incorrect instruction generated! 0x%08X != 0x%08X", output_instruction->instruction, desired_instruction.instruction);
-        abort();
-    }
-
-    // The generated instruction is at [0]. Set this just after it so it will end/halt after executing the generated instruction.
-    const ulp_insn_t end_program[] = {
+    const ulp_insn_t program[] = {
+        I_MOVI(R2, HULP_REGWR_IMM_VAL(ULP_WR_TEST_REG, ULP_WR_TEST_REG_VAL)),
+        I_MOVI(R0, HULP_REGWR_WORK_OFFSET(ULP_WR_TEST_REG_LOW, ULP_WR_TEST_REG_HIGH)),
+        M_MOVL(R3, 1),
+        I_BXI(HULP_WR_REG_GEN_SAFE_ENTRY),
+    M_LABEL(1),
         I_END(),
         I_HALT(),
     };
-    size_t end_program_size = sizeof(end_program) / sizeof(end_program)[0];
-    ESP_ERROR_CHECK( ulp_process_macros_and_load(1, end_program, &end_program_size) );
 
-    // Prepare the pin so we can see if it works. Set output low. If successful, it will be set high by the ULP.
-    ESP_ERROR_CHECK( rtc_gpio_init(GPIO_NUM) );
-    ESP_ERROR_CHECK( rtc_gpio_set_level(GPIO_NUM, 0) );
-    ESP_ERROR_CHECK( rtc_gpio_set_direction(GPIO_NUM, RTC_GPIO_MODE_OUTPUT_ONLY) );
+    size_t program_size = sizeof(program) / sizeof(program[0]);
+    ESP_ERROR_CHECK( ulp_process_macros_and_load(0, program, &program_size) );
 
-    uint32_t reg_before = REG_READ(RTC_GPIO_OUT_REG);
-    uint32_t reg_expected = reg_before | (1 << (RTC_GPIO_OUT_DATA_S + (RTCIO_NUM)));
+    ESP_ERROR_CHECK( ulp_set_wakeup_period(0, 1 * 1000 * 1000) );
     ESP_ERROR_CHECK( ulp_run(0) );
-    // Let ULP execute the generated instruction
+
     vTaskDelay(100 / portTICK_PERIOD_MS);
-    uint32_t reg_after = REG_READ(RTC_GPIO_OUT_REG);
-    if(reg_after != reg_expected)
+
+    uint32_t get_reg = REG_READ(ULP_WR_TEST_REG);
+    uint32_t check_val = (get_reg >> ULP_WR_TEST_REG_LOW) & ~(~0 << (ULP_WR_TEST_REG_HIGH - ULP_WR_TEST_REG_LOW + 1));
+    ESP_LOGI(TAG, "Reg: %u", get_reg);
+    if(check_val != ULP_WR_TEST_REG_VAL)
     {
-        ESP_LOGE(TAG, "Failed. Expected: 0x%08X != Actual: 0x%08X", reg_expected, reg_after);
+        ESP_LOGE(TAG, "FAILED. Got %u, expected %u", check_val, ULP_WR_TEST_REG_VAL);
+        vTaskDelay(portMAX_DELAY);
     }
-    else
+}
+
+esp_err_t load_branch_write_program()
+{
+    const ulp_insn_t program_1025[] = {
+        I_MOVI(R1, R3), // Constant == 3
+        I_ST(R1, R0, 2), // MUST BE AT 1025
+        I_BXI(HULP_WR_REG_GEN_ENTRY),
+    };
+    uint32_t entry_1025 = 1025-1;
+    size_t program_1025_size = sizeof(program_1025) / sizeof(program_1025[0]);
+    ESP_ERROR_CHECK( ulp_process_macros_and_load(entry_1025, program_1025, &program_1025_size) );
+    return ESP_OK;
+}
+
+esp_err_t load_wrreg_st_gen_program()
+{
+    const ulp_insn_t program_832[] = {
+        I_MOVI(R1, (1 << 10) | (R0 << 2) | (R2 << 0)),
+        I_ST(R1, R0, 0), // MUST BE AT 832
+        I_BXR(R0),
+    };
+    uint32_t entry_832 = HULP_WR_REG_GEN_ENTRY;
+    size_t program_832_size = sizeof(program_832) / sizeof(program_832[0]);
+    ESP_ERROR_CHECK( ulp_process_macros_and_load(entry_832, program_832, &program_832_size) );
+    return ESP_OK;
+}
+
+esp_err_t prepare_work_area(uint32_t offset)
+{
+    const ulp_insn_t r3_return = I_BXR(R3);
+    RTC_SLOW_MEM[offset + 2] = r3_return.instruction;
+    return ESP_OK;
+}
+
+void load_ranges_test()
+{
+    ulp_insn_t *movi_addr_and_val = &RTC_SLOW_MEM[0];
+    ulp_insn_t *movi_work_area = &RTC_SLOW_MEM[1];
+
+    uint8_t low_bits[] = {0,8,16,24};
+    for(int l = 0; l < sizeof(low_bits)/sizeof(low_bits[0]); ++l)
     {
-        ESP_LOGI(TAG, "Success! 0x%08X -> 0x%08X", reg_before, reg_after);
+        uint8_t low = low_bits[l];
+        for(int high = low; high < 32; ++high)
+        {
+            // Get a random value of the required number of bits
+            uint8_t val = (esp_random() >> (31 - (high-low))) & 0x3F;
+
+            *movi_addr_and_val = (ulp_insn_t)I_MOVI(R2, HULP_REGWR_IMM_VAL(ULP_WR_TEST_REG, val));
+            *movi_work_area = (ulp_insn_t)I_MOVI(R0, HULP_REGWR_WORK_OFFSET(low, high));
+
+            REG_WRITE(ULP_WR_TEST_REG, 0);
+            ESP_ERROR_CHECK( ulp_run(0) );
+
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            if(REG_GET_FIELD(RTC_CNTL_STATE0_REG, RTC_CNTL_ULP_CP_SLP_TIMER_EN))
+            {
+                ESP_LOGW(TAG, "ULP still running?");
+                vTaskDelay(portMAX_DELAY);
+            }
+
+            uint32_t get_reg = REG_READ(ULP_WR_TEST_REG);
+            uint32_t check_val = (get_reg >> low) & ~(~0ULL << (high - low + 1));
+            if(check_val != val)
+            {
+                ESP_LOGE(TAG, "FAILED [%u:%u]. Got %u, expected %u", high, low, check_val, ULP_WR_TEST_REG_VAL);
+                vTaskDelay(portMAX_DELAY);
+            }
+
+            ESP_LOGI(TAG, "OK @ [%u:%u] 0x%08X , %u %u", high, low, get_reg, check_val, val);
+        }
+    }
+}
+
+static void load_ulp_increments()
+{
+    const ulp_insn_t program[] = {
+        I_MOVI(R2, HULP_REGWR_IMM_VAL(ULP_WR_TEST_REG, 0)),
+        I_MOVI(R0, HULP_REGWR_WORK_OFFSET(0, 5)),
+        M_MOVL(R3, 1),
+        I_WR_REG(SENS_SAR_START_FORCE_REG, SENS_PC_INIT_S + 0, SENS_PC_INIT_S +  7, 4),
+        
+        I_ADDI(R2, R2, 1 << HULP_REGWR_VAL_SHIFT),
+        I_BXI(HULP_WR_REG_GEN_SAFE_ENTRY),
+    M_LABEL(1),
+        I_HALT(),
+    };
+
+    size_t program_size = sizeof(program) / sizeof(program[0]);
+    ESP_ERROR_CHECK( ulp_process_macros_and_load(0, program, &program_size) );
+
+    ESP_ERROR_CHECK( ulp_set_wakeup_period(0, 1 * 1000 * 1000) );
+
+    REG_WRITE(ULP_WR_TEST_REG, 0);
+    ESP_ERROR_CHECK( ulp_run(0) );
+
+    uint32_t reg_current = 0;
+    for(;;)
+    {
+        uint32_t reg_new = REG_READ(ULP_WR_TEST_REG);
+        if(reg_new != reg_current)
+        {
+            reg_current = reg_new;
+            ESP_LOGI(TAG, "ULP Wrote: %u", reg_current);
+        }
+        vTaskDelay(1);
     }
 }
 
 void app_main(void)
 {
-    ulp_generate_insn();
+    load_branch_write_program();
+    load_wrreg_st_gen_program();
+    load_basic_test();
+    load_ranges_test();
+    load_ulp_increments();
     vTaskDelete(NULL);   
 }
