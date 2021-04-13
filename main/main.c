@@ -35,7 +35,7 @@ _Static_assert(sizeof(ulp_stored_word_t) == sizeof(ulp_insn_t), "incompatible st
 
 void ulp_generate_test_insn()
 {
-    memset(RTC_SLOW_MEM, 0, CONFIG_ULP_COPROC_RESERVE_MEM);
+    memset(RTC_SLOW_MEM, 0, CONFIG_ESP32_ULP_COPROC_RESERVE_MEM);
 
     // This is what we want the result of our ST instruction to produce:
     ulp_insn_t desired_instruction = I_ULP_TEST_INSN();
@@ -110,7 +110,7 @@ void ulp_generate_test_insn()
 
 void ulp_generate_loop()
 {
-    memset(RTC_SLOW_MEM, 0, CONFIG_ULP_COPROC_RESERVE_MEM);
+    memset(RTC_SLOW_MEM, 0, CONFIG_ESP32_ULP_COPROC_RESERVE_MEM);
 
     ulp_insn_t desired_instruction = I_ULP_TEST_INSN();
     ulp_stored_word_t* required_st_output = (ulp_stored_word_t*)&desired_instruction;
